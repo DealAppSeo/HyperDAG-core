@@ -38,4 +38,12 @@ reqwest = { version = "0.12", features = ["json"] }
 futures = "0.3"
 # B-2: Poseidon2/BabyBear leaf (Invariant 1) — aggregation-ready commitment for NEW proofs.
 # Path dep on the canonical, KAT-tested leaf crate (same Plonky3 pin 27d59f7350, Invariant 5).
-babybear-leaf = { path = "../babybear-leaf" }
+# GIT dep, not a path dep. Railway builds this service with root directory
+# /services/zkp-postcard, so the Docker context STOPS there and "../babybear-leaf"
+# is outside it — Docker cannot COPY outside its context, so no Dockerfile change
+# can rescue a path dep. Builds have failed since 2026-07-12 for exactly this.
+# Every p3 crate above is already fetched from git in this same build, so this
+# uses a proven mechanism rather than a new one. Pinned to a rev that already
+# contains services/babybear-leaf, so there is no chicken-and-egg.
+# Same Plonky3 rev 27d59f7350 on both sides (CANON P-026 / Invariant 5) — verified.
+babybear-leaf = { git = "https://github.com/DealAppSeo/HyperDAG-core.git", rev = "ed706200ae0851b2d10ba18ee5492e7df1f6b641" }

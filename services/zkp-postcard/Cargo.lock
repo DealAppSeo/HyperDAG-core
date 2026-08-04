@@ -98,6 +98,7 @@ dependencies = [
 [[package]]
 name = "babybear-leaf"
 version = "0.0.0"
+source = "git+https://github.com/DealAppSeo/HyperDAG-core.git?rev=ed706200ae0851b2d10ba18ee5492e7df1f6b641#ed706200ae0851b2d10ba18ee5492e7df1f6b641"
 dependencies = [
  "p3-baby-bear",
  "p3-field",
