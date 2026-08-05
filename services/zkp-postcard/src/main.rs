@@ -294,9 +294,30 @@ async fn main() {
     
     let supabase_url = std::env::var("SUPABASE_URL")
         .expect("SUPABASE_URL must be set");
-    let supabase_key = std::env::var("SUPABASE_SERVICE_KEY")
+    // Accept the SAME three names repid-engine accepts (its src/config.ts), newest
+    // canonical first.
+    //
+    // WHY THIS LIST GREW: on 2026-08-04 this service crash-looped on
+    // "SUPABASE_SERVICE_KEY or SUPABASE_SERVICE_ROLE_KEY must be set: NotPresent"
+    // while the TypeScript engine — talking to the same Supabase project — stayed
+    // up. The credential had not been revoked; the Supabase key migration moved it
+    // to `SUPABASE_SECRET_KEY`, a name config.ts already accepted and this binary
+    // did not. One service surviving a rename while its sibling dies is not a
+    // credential problem, it is a VOCABULARY problem — and it is the third time
+    // this shape has cost real downtime here (a dead DATABASE_URL on one service
+    // while 25 others were fine; a present-but-dead HUGGINGFACE_API_TOKEN).
+    //
+    // So the durable fix is to converge on one accepted set, not to re-set the old
+    // variable. The legacy names stay: dropping them would merely invert which
+    // deployment breaks.
+    let supabase_key = std::env::var("SUPABASE_SECRET_KEY")
+        .or_else(|_| std::env::var("SUPABASE_SERVICE_KEY"))
         .or_else(|_| std::env::var("SUPABASE_SERVICE_ROLE_KEY"))
-        .expect("SUPABASE_SERVICE_KEY or SUPABASE_SERVICE_ROLE_KEY must be set");
+        .expect(
+            "one of SUPABASE_SECRET_KEY / SUPABASE_SERVICE_KEY / SUPABASE_SERVICE_ROLE_KEY \
+             must be set (repid-engine accepts the same three — if the engine is up and this \
+             is not, the key was RENAMED rather than revoked)",
+        );
 
     let state = Arc::new(AppState {
         store,
