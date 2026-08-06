@@ -2,19 +2,12 @@
 //! Poseidon2-16 permutation (`p3_baby_bear::default_babybear_poseidon2_16()` — NO
 //! hand-rolled constants). Ports the BN254/circom `reputation_proof.circom` leaf to
 //! BabyBear per ZK_BABYBEAR_LEAF_PORT_SPEC. Scoped nullifier per Inv-2.
-//!
-//! SCOPE OF THIS FILE: the field computations only (commitment, Merkle membership,
-//! scoped nullifier) + KAT tests proving they match CC2's canonical vectors. The
-//! IN-CIRCUIT AIR constraints (proving these relations inside a STARK) are the next
-//! layer; the points/contrib range-checks reuse zkp-postcard's existing u32 range-check
-//! AIR. The BN254 circom leaf is NOT deleted — retirement waits until this is load-bearing.
-//!
-//! Mirrors CC2's generator (03_specs/poseidon2_kat_generator) exactly so the leaf is
-//! correct-by-construction against poseidon2_babybear_kat_v1.json.
 
 use p3_baby_bear::{BabyBear, default_babybear_poseidon2_16};
 use p3_field::PrimeField32;
 use p3_symmetric::Permutation;
+use sha2::{Digest, Sha256};
+use wasm_bindgen::prelude::*;
 
 pub const WIDTH: usize = 16;
 
@@ -35,8 +28,7 @@ pub fn permute16(p: &impl Permutation<[BabyBear; WIDTH]>, x: [u32; WIDTH]) -> [u
 }
 
 /// Single-field digest: `permute([inputs.., 0-pad])[0]`. ONE hash primitive for the
-/// leaf, all from the canonical permutation. (Capacity / domain-separation layout is
-/// Track B's to ratify — matches the KAT's `nullifier_def` note.)
+/// leaf, all from the canonical permutation.
 pub fn hash(p: &impl Permutation<[BabyBear; WIDTH]>, inputs: &[u32]) -> u32 {
     let mut a = [0u32; WIDTH];
     for (i, x) in inputs.iter().take(WIDTH).enumerate() {
@@ -62,9 +54,6 @@ pub fn merkle_compress(p: &impl Permutation<[BabyBear; WIDTH]>, left: u32, right
 }
 
 /// SCOPED nullifier (Inv-2): `N(secret, scope) = permute([secret, scope, 0..])[0]`.
-/// `scope` is a PARAMETER — agentId for ownership, studyId (reserved) for the health
-/// vertical — NEVER hardcoded (the circom leaf's `Poseidon(2)(nullifier, 1)` literal `1`
-/// is exactly the Inv-2 violation this fixes). Different scope => different nullifier.
 pub fn nullifier(p: &impl Permutation<[BabyBear; WIDTH]>, secret: u32, scope: u32) -> u32 {
     hash(p, &[secret, scope])
 }
@@ -92,3 +81,37 @@ pub fn merkle_root(
     }
     acc
 }
+
+fn agent_id_to_16_bytes(agent_id: &str) -> [u8; 16] {
+    let cleaned: String = agent_id.chars().filter(|c| *c != '-').collect();
+    if cleaned.len() == 32 && cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
+        if let Ok(bytes) = hex::decode(&cleaned) {
+            let mut arr = [0u8; 16];
+            arr.copy_from_slice(&bytes);
+            return arr;
+        }
+    }
+    let digest = Sha256::digest(agent_id.as_bytes());
+    let mut arr = [0u8; 16];
+    arr.copy_from_slice(&digest[..16]);
+    arr
+}
+
+/// B-2 — aggregation-ready Poseidon2/BabyBear LEAF (Invariant 1). A single BabyBear field element
+/// committing the postcard statement {agent_id, threshold, repid_score}, computed with the canonical
+/// `default_babybear_poseidon2_16()` permutation.
+#[wasm_bindgen]
+pub fn poseidon2_postcard_leaf(agent_id: &str, threshold: u64, repid_score: u64) -> String {
+    let bytes = agent_id_to_16_bytes(agent_id);
+    let mut inputs: Vec<u32> = Vec::with_capacity(10);
+    for i in 0..8 {
+        inputs.push(((bytes[2 * i] as u32) << 8) | (bytes[2 * i + 1] as u32));
+    }
+    inputs.push((threshold % (1u64 << 31)) as u32);
+    inputs.push((repid_score % (1u64 << 31)) as u32);
+    let p = poseidon2_16();
+    let leaf = hash(&p, &inputs);
+    format!("0x{:08x}", leaf)
+}
+pub mod fold;
+pub mod fold_c1;
