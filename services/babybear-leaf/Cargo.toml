@@ -6,12 +6,30 @@ name = "babybear-leaf"
 version = "0.0.0"
 edition = "2021"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [workspace]
 
 [dependencies]
+p3-poseidon2-air = { git = "https://github.com/Plonky3/Plonky3", rev = "27d59f7350daf6b02d11b01c3a55af453554b515" }
+p3-matrix = { git = "https://github.com/Plonky3/Plonky3", rev = "27d59f7350daf6b02d11b01c3a55af453554b515" }
+p3-uni-stark = { git = "https://github.com/Plonky3/Plonky3", rev = "27d59f7350daf6b02d11b01c3a55af453554b515" }
+p3-air = { git = "https://github.com/Plonky3/Plonky3", rev = "27d59f7350daf6b02d11b01c3a55af453554b515" }
+p3-fri = { git = "https://github.com/Plonky3/Plonky3", rev = "27d59f7350daf6b02d11b01c3a55af453554b515" }
+p3-commit = { git = "https://github.com/Plonky3/Plonky3", rev = "27d59f7350daf6b02d11b01c3a55af453554b515" }
+p3-challenger = { git = "https://github.com/Plonky3/Plonky3", rev = "27d59f7350daf6b02d11b01c3a55af453554b515" }
+p3-merkle-tree = { git = "https://github.com/Plonky3/Plonky3", rev = "27d59f7350daf6b02d11b01c3a55af453554b515" }
+p3-dft = { git = "https://github.com/Plonky3/Plonky3", rev = "27d59f7350daf6b02d11b01c3a55af453554b515" }
+p3-monty-31 = { git = "https://github.com/Plonky3/Plonky3", rev = "27d59f7350daf6b02d11b01c3a55af453554b515" }
+p3-keccak = { git = "https://github.com/Plonky3/Plonky3", rev = "27d59f7350daf6b02d11b01c3a55af453554b515" }
 p3-baby-bear = { git = "https://github.com/Plonky3/Plonky3", rev = "27d59f7350daf6b02d11b01c3a55af453554b515" }
 p3-field     = { git = "https://github.com/Plonky3/Plonky3", rev = "27d59f7350daf6b02d11b01c3a55af453554b515" }
 p3-symmetric = { git = "https://github.com/Plonky3/Plonky3", rev = "27d59f7350daf6b02d11b01c3a55af453554b515" }
+wasm-bindgen = "0.2"
+sha2 = "0.10"
+hex = "0.4"
 
 [dev-dependencies]
+bincode = "1"
 serde_json = "1"
