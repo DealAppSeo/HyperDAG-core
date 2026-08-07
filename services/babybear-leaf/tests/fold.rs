@@ -176,3 +176,55 @@ fn claims_are_reported_honestly() {
     assert!(c.weighted_update_enforced);
     assert!(c.threshold_claim_enforced);
 }
+
+/// The trap that bit the live demo, pinned so it cannot bite again.
+///
+/// `weighted_update` is `prev + new*weight`. With weight = 0 the new outcome is
+/// multiplied away and the result is just `prev` — so a caller passing weight = 0
+/// gets a fold that VERIFIES CLEANLY while committing to a score that has nothing
+/// to do with the outcome. The demo did exactly this. No single run could reveal
+/// it: each was internally consistent and each verified. It surfaced only when
+/// two runs with very different outcomes produced byte-identical roots.
+#[test]
+fn weight_zero_makes_the_update_vacuous_and_that_is_worth_knowing() {
+    assert_eq!(weighted_update(2070, 25, 0), 2070, "weight 0 discards the outcome entirely");
+    assert_eq!(weighted_update(2070, 999_999, 0), 2070, "no matter how large the outcome");
+    assert_eq!(weighted_update(2070, 25, 1), 2095, "weight 1 is the binding case");
+
+    // And the consequence at the root: identical roots for different outcomes.
+    let mk = |outcome: u32, weight: u32| {
+        let score = weighted_update(2070, outcome, weight);
+        compute_fold_root(&FoldStatement {
+            prev_fold_root: 0,
+            new_outcome_commitment: 0,
+            new_nullifier: 0,
+            updated_components: score,
+            user_standards_hash: 42,
+            new_fold_root: 0,
+            threshold: 999,
+            new_score: score,
+        })
+    };
+    assert_eq!(mk(25, 0), mk(999_999, 0), "weight 0: different outcomes collapse to ONE root");
+    assert_ne!(mk(25, 1), mk(50, 1), "weight 1: distinct outcomes -> distinct roots");
+}
+
+/// An unsigned field cannot express a DECREASE through `prev + new*weight`.
+///
+/// A caller needing the root to commit to a REDUCED score must pass the already
+/// reduced value as `prev_state` — and must not then claim the arithmetic was
+/// constrained, because at weight 0 the constraint degenerates to `x == x`.
+#[test]
+fn a_decrease_is_unrepresentable_by_the_weighted_update_rule() {
+    for outcome in 0u32..200 {
+        for weight in 0u32..5 {
+            assert_ne!(
+                weighted_update(2070, outcome, weight),
+                1950,
+                "unsigned saturating_add can never reduce a score"
+            );
+        }
+    }
+    // The supported route: pass the reduced score directly, with weight 0.
+    assert_eq!(weighted_update(1950, 0, 0), 1950);
+}
