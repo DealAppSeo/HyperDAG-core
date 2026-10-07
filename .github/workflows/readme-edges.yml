@@ -1,0 +1,40 @@
+# Checks the edges README.md names (routes, outbound calls, caller, domain, map link)
+# against the code. See scripts/check-readme-edges.mjs.
+#
+# Exit codes from the script: 0 VERIFIED, 1 FAILED, 2 NOT CHECKED. Any non-zero fails the job.
+# DealAppSeo/repid-engine (public) is checked out read-only so that the "Called by" edge is
+# checked against the caller's own source, not just restated. Without it the script reports
+# NOT CHECKED, which fails the job.
+name: readme-edges
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  readme-edges:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out the caller (DealAppSeo/repid-engine, src/ only, read-only)
+        uses: actions/checkout@v4
+        with:
+          repository: DealAppSeo/repid-engine
+          path: _repid-engine
+          fetch-depth: 1
+          sparse-checkout: src
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Check README edges against the code
+        env:
+          REPID_ENGINE_DIR: _repid-engine
+        run: node scripts/check-readme-edges.mjs
