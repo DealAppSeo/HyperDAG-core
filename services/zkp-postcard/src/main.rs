@@ -2,44 +2,36 @@
 //!
 //! Proves "RepID > threshold" using a Plonky3 STARK range-check on BabyBear field.
 //! The circuit decomposes (repid - threshold - 1) into 32 bits and proves non-negativity.
-//! Private input: actual RepID score. Public output: commitment + proof that score > threshold.
+//! The score is NOT a private input. The statement {agent_id, threshold, repid_score} is entirely
+//! public: all three are circuit public values, and the response returns the score as
+//! `repid_score_actual`. The proof binds "this agent's score > threshold"; it does not hide the score.
 
 mod circuit;
 
 use axum::{
-    extract::{Path, State},
-    http::StatusCode,
-    response::Json,
+    extract::{Request, State},
+    http::{header, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Json, Response},
     routing::{get, post},
     Router,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Instant};
-use tokio::sync::RwLock;
+use std::{net::SocketAddr, sync::Arc, time::Instant};
 use tower_http::cors::CorsLayer;
 use base64::Engine;
 
 struct AppState {
-    store: Arc<RwLock<HashMap<String, ProofRecord>>>,
     http_client: reqwest::Client,
     supabase_url: String,
     supabase_key: String,
+    /// `PROVER_AUTH_TOKEN`, trimmed. `None` means auth is NOT configured, and then every route
+    /// except `/health` answers 503. It never means "serve without auth".
+    auth_token: Option<String>,
 }
 
 type SharedState = Arc<AppState>;
-
-#[derive(Clone, Serialize, Deserialize)]
-struct ProofRecord {
-    agent_id: String,
-    threshold: u64,
-    tier: String,
-    statement: String,
-    proof_type: String,
-    verified: bool,
-    proof_size_bytes: usize,
-    proving_time_ms: u64,
-}
 
 #[derive(Deserialize)]
 struct ProofRequest {
@@ -74,15 +66,8 @@ struct ProofResponse {
     // are left untouched. Empty for the sha256 fallback path.
     poseidon2_leaf: String,
     leaf_scheme: String,
-}
-
-#[derive(Serialize)]
-struct VerifyResponse {
-    valid: bool,
-    statement: String,
-    agent_id: String,
-    proof_type: String,
-    protocol: String,
+    /// Why there is no proof: `not_above_threshold` or `proving_failed`. `null` on a real proof.
+    reason: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -92,6 +77,8 @@ struct HealthResponse {
     version: String,
     proof_types: Vec<String>,
     protocol: String,
+    /// Whether `PROVER_AUTH_TOKEN` is set. Never the token itself.
+    auth_configured: bool,
 }
 
 async fn fetch_agent_repid(
@@ -157,17 +144,154 @@ fn sha256_commitment(agent_id: &str, repid: u64, threshold: u64) -> String {
     format!("0x{}", hex::encode(hasher.finalize()))
 }
 
-async fn health() -> Json<HealthResponse> {
+async fn health(State(state): State<SharedState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "healthy".into(),
         service: "zkp-postcard".into(),
         version: "0.2.0".into(),
         proof_types: vec![
-            "plonky3_range_check".into(),
-            "sha256_commitment_poc".into(),
+            PROOF_TYPE_REAL.into(),
+            PROOF_TYPE_NONE.into(),
         ],
         protocol: "HyperDAG Trust Protocol v1".into(),
+        auth_configured: state.auth_token.is_some(),
     })
+}
+
+// ---------------------------------------------------------------------------------------------
+// What a proof request produced. The ONLY place `verified` is decided.
+// ---------------------------------------------------------------------------------------------
+
+/// A real STARK proof is in `proof_bytes`.
+const PROOF_TYPE_REAL: &str = "plonky3_range_check";
+/// NO proof. `proof_bytes` holds a placeholder string, not a proof.
+const PROOF_TYPE_NONE: &str = "sha256_commitment_poc";
+const REASON_NOT_ABOVE_THRESHOLD: &str = "not_above_threshold";
+const REASON_PROVING_FAILED: &str = "proving_failed";
+
+struct ProofOutcome {
+    proof_type: &'static str,
+    proof_bytes: Vec<u8>,
+    verified: bool,
+    reason: Option<&'static str>,
+}
+
+/// F-10 (2026-10-07): `verified` is true ONLY when a real proof exists. `prove_range_check`
+/// verifies every proof before returning it, so `Ok` means proved AND verified here.
+///
+/// `verified` used to be `repid > threshold`. When proving FAILED for an agent above the
+/// threshold, the response therefore said `verified: true` next to a placeholder in
+/// `proof_bytes`: a pass on a miss. The two no-proof paths keep their existing `proof_type` and
+/// placeholder bytes, because callers already key on those, and now also say why.
+fn proof_outcome(above: bool, prove: impl FnOnce() -> Result<Vec<u8>, String>) -> ProofOutcome {
+    if !above {
+        return ProofOutcome {
+            proof_type: PROOF_TYPE_NONE,
+            proof_bytes: b"not_above_threshold".to_vec(),
+            verified: false,
+            reason: Some(REASON_NOT_ABOVE_THRESHOLD),
+        };
+    }
+    match prove() {
+        Ok(bytes) => ProofOutcome {
+            proof_type: PROOF_TYPE_REAL,
+            proof_bytes: bytes,
+            verified: true,
+            reason: None,
+        },
+        Err(e) => {
+            eprintln!("[ZKP] Plonky3 proof failed ({}); answering verified=false with no proof", e);
+            ProofOutcome {
+                proof_type: PROOF_TYPE_NONE,
+                proof_bytes: b"sha256_fallback_placeholder".to_vec(),
+                verified: false,
+                reason: Some(REASON_PROVING_FAILED),
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Authentication (F-10, 2026-10-07)
+// ---------------------------------------------------------------------------------------------
+
+/// The only paths served without a token. `/health` stays public because
+/// DealAppSeo/trinity-symphony-shared's pulse check calls it with no credentials.
+const PUBLIC_PATHS: &[&str] = &["/health"];
+
+/// `None` = not configured. Whitespace-only counts as unset, so an empty secret can never match.
+fn auth_token_from(value: Option<String>) -> Option<String> {
+    value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
+/// The token from `Authorization: Bearer <token>` (scheme case-insensitive, per RFC 7235).
+fn bearer_token(value: &[u8]) -> Option<&[u8]> {
+    const SCHEME: &[u8] = b"bearer ";
+    if value.len() < SCHEME.len() || !value[..SCHEME.len()].eq_ignore_ascii_case(SCHEME) {
+        return None;
+    }
+    let token = value[SCHEME.len()..].trim_ascii();
+    if token.is_empty() { None } else { Some(token) }
+}
+
+/// Constant-time. Both sides are hashed to 32 bytes first, so the comparison never stops at the
+/// first differing byte and does not leak the expected token's length.
+fn token_matches(presented: &[u8], expected: &[u8]) -> bool {
+    let a = Sha256::digest(presented);
+    let b = Sha256::digest(expected);
+    let diff = a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y));
+    std::hint::black_box(diff) == 0
+}
+
+/// Until F-10 the prover had no authentication: anyone could POST an agent id and read back that
+/// agent's score and tier, at our CPU cost. Now, on every path except `PUBLIC_PATHS`:
+///   - `PROVER_AUTH_TOKEN` unset or empty -> 503. FAILS CLOSED; it never serves unauthenticated.
+///   - bearer token missing or wrong      -> 401.
+///   - bearer token matches               -> the route runs.
+/// It runs before any handler, so a refused request costs no Supabase read and no proving.
+/// Neither the token nor the Authorization header is ever logged or echoed.
+async fn require_bearer(State(state): State<SharedState>, req: Request, next: Next) -> Response {
+    if PUBLIC_PATHS.contains(&req.uri().path()) {
+        return next.run(req).await;
+    }
+    let Some(expected) = state.auth_token.as_deref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "auth_not_configured",
+                "detail": "PROVER_AUTH_TOKEN is not set on this service, so every route except /health is refused"
+            })),
+        )
+            .into_response();
+    };
+    let presented = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| bearer_token(v.as_bytes()));
+    match presented {
+        Some(token) if token_matches(token, expected.as_bytes()) => next.run(req).await,
+        _ => (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+            Json(serde_json::json!({ "error": "unauthorized" })),
+        )
+            .into_response(),
+    }
+}
+
+/// The whole service, built in one place so the tests exercise exactly what `main` serves.
+///
+/// The auth layer goes on AFTER every route: axum applies `.layer` only to routes added before
+/// it (and to the fallback), so a route added above this line is protected by default. Do not add
+/// a `.route` below it.
+fn app(state: SharedState) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/zkp/repid-proof", post(generate_proof))
+        .route("/prove/trade_auth", post(generate_proof))
+        .layer(middleware::from_fn_with_state(state.clone(), require_bearer))
+        .layer(CorsLayer::permissive())
+        .with_state(state)
 }
 
 async fn generate_proof(
@@ -206,31 +330,19 @@ async fn generate_proof(
 
     let start = Instant::now();
 
-    // Try Plonky3 STARK proof
-    let (proof_type, commitment, proof_bytes) = if above {
+    // Try a Plonky3 STARK proof. Agent-bound: the statement is the public tuple
+    // {agent_id, threshold, repid_score}. The closure runs only when `above`, so no underflow.
+    let outcome = proof_outcome(above, || {
         let diff = (repid - threshold - 1) as u32;
-        // Agent-bound proof: statement is the public tuple {agent_id, threshold, repid_score}.
-        match circuit::prove_range_check(diff, &agent_id, threshold, repid) {
-            Ok(bytes) => {
-                let commitment = sha256_commitment(&agent_id, repid, threshold);
-                ("plonky3_range_check".to_string(), commitment, bytes)
-            }
-            Err(e) => {
-                eprintln!("[ZKP] Plonky3 proof failed ({}), falling back to SHA-256", e);
-                let commitment = sha256_commitment(&agent_id, repid, threshold);
-                ("sha256_commitment_poc".to_string(), commitment, "sha256_fallback_placeholder".as_bytes().to_vec())
-            }
-        }
-    } else {
-        let commitment = sha256_commitment(&agent_id, repid, threshold);
-        ("sha256_commitment_poc".to_string(), commitment, "not_above_threshold".as_bytes().to_vec())
-    };
+        circuit::prove_range_check(diff, &agent_id, threshold, repid)
+    });
+    let commitment = sha256_commitment(&agent_id, repid, threshold);
 
-    let proof_size = proof_bytes.len();
-    let proof_bytes_str = base64::engine::general_purpose::STANDARD.encode(&proof_bytes);
+    let proof_size = outcome.proof_bytes.len();
+    let proof_bytes_str = base64::engine::general_purpose::STANDARD.encode(&outcome.proof_bytes);
 
     // B-2: compute the Poseidon2/BabyBear aggregation-ready leaf for real proofs only.
-    let (poseidon2_leaf, leaf_scheme) = if proof_type == "plonky3_range_check" {
+    let (poseidon2_leaf, leaf_scheme) = if outcome.proof_type == PROOF_TYPE_REAL {
         (circuit::poseidon2_postcard_leaf(&agent_id, threshold, repid), "poseidon2_babybear".to_string())
     } else {
         (String::new(), String::new())
@@ -238,23 +350,11 @@ async fn generate_proof(
 
     let proving_time = start.elapsed().as_millis() as u64;
 
-    let record = ProofRecord {
-        agent_id: agent_id.clone(),
-        threshold,
-        tier: tier.clone(),
-        statement: statement.clone(),
-        proof_type: proof_type.clone(),
-        verified: above,
-        proof_size_bytes: proof_size,
-        proving_time_ms: proving_time,
-    };
-    state.store.write().await.insert(commitment.clone(), record);
-
     Ok(Json(ProofResponse {
-        proof_type,
+        proof_type: outcome.proof_type.to_string(),
         public_statement: statement,
         commitment,
-        verified: above,
+        verified: outcome.verified,
         agent_id: agent_id.clone(),
         erc8004_token_id: agent_id,
         tier,
@@ -268,28 +368,19 @@ async fn generate_proof(
         score_source: "server_side_lookup".into(),
         poseidon2_leaf,
         leaf_scheme,
+        reason: outcome.reason.map(str::to_string),
     }))
 }
 
-async fn verify_proof(
-    State(state): State<SharedState>,
-    Path(commitment): Path<String>,
-) -> Result<Json<VerifyResponse>, StatusCode> {
-    let records = state.store.read().await;
-    let record = records.get(&commitment).ok_or(StatusCode::NOT_FOUND)?;
-
-    Ok(Json(VerifyResponse {
-        valid: record.verified,
-        statement: record.statement.clone(),
-        agent_id: record.agent_id.clone(),
-        proof_type: record.proof_type.clone(),
-        protocol: "HyperDAG Trust Protocol v1".into(),
-    }))
-}
+// `GET /zkp/verify/{commitment}` was REMOVED here (F-10, 2026-10-07). It never routed (axum 0.8
+// `{param}` syntax under axum 0.7.9), and it could not have done a real check if it had: it read
+// a stored `repid > threshold` flag out of an in-process map that held neither the proof bytes
+// nor the score, so it could only repeat what this process had said, and only until a restart.
+// The map also grew by one entry per request, forever. A real check needs the proof bytes and the
+// statement, and the independent verifier (`@hyperdag/proof-verifier`) is where that happens.
 
 #[tokio::main]
 async fn main() {
-    let store = Arc::new(RwLock::new(HashMap::new()));
     let http_client = reqwest::Client::new();
     
     let supabase_url = std::env::var("SUPABASE_URL")
@@ -319,11 +410,15 @@ async fn main() {
              is not, the key was RENAMED rather than revoked)",
         );
 
+    // Fail closed, but stay up: with no token the service still answers /health (which reports
+    // `auth_configured: false`) and refuses everything else with 503, rather than crash-looping.
+    let auth_token = auth_token_from(std::env::var("PROVER_AUTH_TOKEN").ok());
+
     let state = Arc::new(AppState {
-        store,
         http_client,
         supabase_url,
         supabase_key,
+        auth_token,
     });
 
     let port: u16 = std::env::var("PORT")
@@ -331,19 +426,271 @@ async fn main() {
         .parse()
         .unwrap_or(8080);
 
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/zkp/repid-proof", post(generate_proof))
-        .route("/prove/trade_auth", post(generate_proof))
-        .route("/zkp/verify/{commitment}", get(verify_proof))
-        .layer(CorsLayer::permissive())
-        .with_state(state);
-
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     println!("ZKP Postcard v0.2.0 listening on {}", addr);
     println!("Plonky3 STARK range-check (BabyBear field)");
     println!("HyperDAG Trust Protocol v1");
+    if state.auth_token.is_some() {
+        println!("Auth: bearer token required on every route except /health");
+    } else {
+        eprintln!("[ZKP] PROVER_AUTH_TOKEN is not set: every route except /health answers 503 until it is");
+    }
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app(state)).await.unwrap();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Tests. The HTTP tests run the real router from `app()` on a loopback port, against a stand-in
+// for the one Supabase query, so they exercise the same layers and handler `main` serves.
+// ---------------------------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const AGENT: &str = "394b6ee4-62e7-4c66-8445-29107b097b4c";
+    /// A test fixture, not a credential: it exists only inside these tests.
+    const TOKEN: &str = "test-fixture-token-0123456789";
+
+    fn client() -> reqwest::Client {
+        reqwest::Client::builder().no_proxy().build().unwrap()
+    }
+
+    async fn serve(router: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        url
+    }
+
+    /// Answers the prover's one Supabase query with a fixed score and tier, and counts hits, so a
+    /// test can show that a refused request never reached the handler.
+    async fn fake_supabase(score: u64, tier: &'static str) -> (String, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let router = Router::new().route(
+            "/rest/v1/repid_agents",
+            get(move || {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!([{ "current_repid": score, "tier": tier }]))
+                }
+            }),
+        );
+        (serve(router).await, hits)
+    }
+
+    async fn prover(auth_token: Option<&str>, supabase_url: String) -> String {
+        serve(app(Arc::new(AppState {
+            http_client: client(),
+            supabase_url,
+            supabase_key: "test-supabase-key".into(),
+            auth_token: auth_token_from(auth_token.map(str::to_string)),
+        })))
+        .await
+    }
+
+    async fn prove(base: &str, authorization: Option<&str>) -> reqwest::Response {
+        let mut req = client()
+            .post(format!("{}/zkp/repid-proof", base))
+            .json(&serde_json::json!({ "agent_id": AGENT }));
+        if let Some(a) = authorization {
+            req = req.header(header::AUTHORIZATION, a);
+        }
+        req.send().await.unwrap()
+    }
+
+    fn bearer() -> String {
+        format!("Bearer {}", TOKEN)
+    }
+
+    // ----- fallback truth -------------------------------------------------------------------
+
+    #[test]
+    fn proving_failure_is_not_verified() {
+        let o = proof_outcome(true, || Err("forced failure".into()));
+        assert!(!o.verified, "a failed proof must never answer verified=true");
+        assert_eq!(o.proof_type, PROOF_TYPE_NONE);
+        assert_eq!(o.reason, Some(REASON_PROVING_FAILED));
+    }
+
+    #[test]
+    fn not_above_threshold_is_not_verified_and_does_not_prove() {
+        let o = proof_outcome(false, || panic!("must not attempt a proof below the threshold"));
+        assert!(!o.verified);
+        assert_eq!(o.proof_type, PROOF_TYPE_NONE);
+        assert_eq!(o.reason, Some(REASON_NOT_ABOVE_THRESHOLD));
+    }
+
+    #[test]
+    fn real_proof_is_verified() {
+        let o = proof_outcome(true, || Ok(vec![1, 2, 3]));
+        assert!(o.verified);
+        assert_eq!(o.proof_type, PROOF_TYPE_REAL);
+        assert_eq!(o.reason, None);
+    }
+
+    /// End to end through the real handler and circuit. A score >= 2^31 cannot be encoded as a
+    /// public value, so `prove_range_check` returns Err and the fallback path runs. Before F-10
+    /// this exact response said `verified: true`.
+    #[tokio::test]
+    async fn http_proving_failure_answers_verified_false() {
+        let (sb, _) = fake_supabase(1u64 << 31, "ESTABLISHED").await;
+        let base = prover(Some(TOKEN), sb).await;
+        let res = prove(&base, Some(&bearer())).await;
+        assert_eq!(res.status(), 200);
+        let body: serde_json::Value = res.json().await.unwrap();
+        assert_eq!(body["proof_type"], PROOF_TYPE_NONE);
+        assert_eq!(body["verified"], false, "fallback said verified: {}", body);
+        assert_eq!(body["reason"], REASON_PROVING_FAILED);
+        assert_eq!(body["poseidon2_leaf"], "");
+    }
+
+    /// Positive control: the right token reaches the handler, and a real proof still says true.
+    #[tokio::test]
+    async fn http_real_proof_answers_verified_true() {
+        let (sb, hits) = fake_supabase(2280, "ESTABLISHED").await;
+        let base = prover(Some(TOKEN), sb).await;
+        let res = prove(&base, Some(&bearer())).await;
+        assert_eq!(res.status(), 200);
+        let body: serde_json::Value = res.json().await.unwrap();
+        assert_eq!(body["proof_type"], PROOF_TYPE_REAL);
+        assert_eq!(body["verified"], true);
+        assert!(body["reason"].is_null());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn http_below_threshold_answers_verified_false() {
+        let (sb, _) = fake_supabase(500, "ESTABLISHED").await; // threshold 999
+        let base = prover(Some(TOKEN), sb).await;
+        let body: serde_json::Value = prove(&base, Some(&bearer())).await.json().await.unwrap();
+        assert_eq!(body["proof_type"], PROOF_TYPE_NONE);
+        assert_eq!(body["verified"], false);
+        assert_eq!(body["reason"], REASON_NOT_ABOVE_THRESHOLD);
+    }
+
+    // ----- authentication -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn protected_routes_answer_401_without_a_token() {
+        let (sb, hits) = fake_supabase(2280, "ESTABLISHED").await;
+        let base = prover(Some(TOKEN), sb).await;
+        for path in ["/zkp/repid-proof", "/prove/trade_auth"] {
+            let res = client()
+                .post(format!("{}{}", base, path))
+                .json(&serde_json::json!({ "agent_id": AGENT }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), 401, "{} without a token", path);
+            assert_eq!(res.headers()[header::WWW_AUTHENTICATE], "Bearer");
+        }
+        // An unknown path is refused too: the layer wraps the fallback, not just named routes.
+        let res = client().get(format!("{}/anything-else", base)).send().await.unwrap();
+        assert_eq!(res.status(), 401);
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "a refused request must not reach Supabase");
+    }
+
+    #[tokio::test]
+    async fn protected_routes_answer_401_with_a_wrong_token() {
+        let (sb, hits) = fake_supabase(2280, "ESTABLISHED").await;
+        let base = prover(Some(TOKEN), sb).await;
+        let wrong = [
+            "Bearer wrong-token".to_string(),
+            format!("Bearer {}x", TOKEN),                  // the right token plus one byte
+            format!("Bearer {}", &TOKEN[..TOKEN.len() - 1]), // the right token minus one byte
+            format!("Basic {}", TOKEN),                    // right value, wrong scheme
+            format!("{}", TOKEN),                          // no scheme
+            "Bearer ".to_string(),                         // empty token
+        ];
+        for auth in &wrong {
+            let res = prove(&base, Some(auth)).await;
+            assert_eq!(res.status(), 401, "Authorization {:?} must be refused", auth);
+            let text = res.text().await.unwrap();
+            assert!(!text.contains(TOKEN), "a 401 must not echo the presented or expected token");
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn protected_routes_answer_503_when_auth_is_not_configured() {
+        for configured in [None, Some(""), Some("   ")] {
+            let (sb, hits) = fake_supabase(2280, "ESTABLISHED").await;
+            let base = prover(configured, sb).await;
+            for auth in [None, Some(bearer()), Some("Bearer ".to_string())] {
+                let res = prove(&base, auth.as_deref()).await;
+                assert_eq!(res.status(), 503, "PROVER_AUTH_TOKEN={:?}, Authorization {:?}", configured, auth);
+                let body: serde_json::Value = res.json().await.unwrap();
+                assert_eq!(body["error"], "auth_not_configured");
+            }
+            assert_eq!(hits.load(Ordering::SeqCst), 0, "unconfigured auth must never serve");
+        }
+    }
+
+    #[tokio::test]
+    async fn health_is_public_and_reports_auth_state_without_the_token() {
+        for (configured, expect) in [(Some(TOKEN), true), (None, false)] {
+            let (sb, hits) = fake_supabase(2280, "ESTABLISHED").await;
+            let base = prover(configured, sb).await;
+            let res = client().get(format!("{}/health", base)).send().await.unwrap();
+            assert_eq!(res.status(), 200);
+            let text = res.text().await.unwrap();
+            assert!(!text.contains(TOKEN), "/health must never contain the token");
+            let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(body["auth_configured"], expect);
+            assert_eq!(hits.load(Ordering::SeqCst), 0, "/health does not contact Supabase");
+        }
+    }
+
+    // ----- the verify route is gone ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn verify_route_is_removed() {
+        let (sb, _) = fake_supabase(2280, "ESTABLISHED").await;
+        let base = prover(Some(TOKEN), sb).await;
+        let commitment = sha256_commitment(AGENT, 2280, 999);
+        for path in [format!("/zkp/verify/{}", commitment), "/zkp/verify/{commitment}".to_string()] {
+            let res = client()
+                .get(format!("{}{}", base, path))
+                .header(header::AUTHORIZATION, bearer())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), 404, "GET {} must not answer anything", path);
+        }
+    }
+
+    // ----- the pieces -----------------------------------------------------------------------
+
+    #[test]
+    fn token_comparison() {
+        assert!(token_matches(b"abc", b"abc"));
+        assert!(!token_matches(b"abd", b"abc"));
+        assert!(!token_matches(b"ab", b"abc"));
+        assert!(!token_matches(b"abcd", b"abc"));
+        assert!(!token_matches(b"", b"abc"));
+    }
+
+    #[test]
+    fn bearer_parsing() {
+        assert_eq!(bearer_token(b"Bearer tok"), Some(&b"tok"[..]));
+        assert_eq!(bearer_token(b"bearer tok"), Some(&b"tok"[..]));
+        assert_eq!(bearer_token(b"BEARER  tok "), Some(&b"tok"[..]));
+        assert_eq!(bearer_token(b"Basic tok"), None);
+        assert_eq!(bearer_token(b"Bearertok"), None);
+        assert_eq!(bearer_token(b"Bearer "), None);
+        assert_eq!(bearer_token(b"Bearer"), None);
+        assert_eq!(bearer_token(b""), None);
+    }
+
+    #[test]
+    fn auth_token_parsing() {
+        assert_eq!(auth_token_from(None), None);
+        assert_eq!(auth_token_from(Some(String::new())), None);
+        assert_eq!(auth_token_from(Some("  \n".into())), None);
+        assert_eq!(auth_token_from(Some(" tok\n".into())), Some("tok".to_string()));
+    }
 }

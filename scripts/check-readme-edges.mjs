@@ -7,8 +7,9 @@
 // a DealAppSeo/repid-engine checkout, it also checks the "Called by" edge against the caller's
 // source.
 //
-// It checks edges, not a picture: routes, outbound requests, env vars, the one deployment
-// domain, and the map link.
+// It checks edges, not a picture: routes and which of them need the auth token, outbound
+// requests, env vars, the one deployment domain, and the map link. `#[cfg(test)]` modules are
+// skipped: a test's stand-in server and HTTP client are not edges of the running service.
 //
 // Exit codes. There are three outcomes, never two:
 //   0  VERIFIED     every check ran and passed
@@ -91,6 +92,40 @@ function stripRustComments(src) {
   return out;
 }
 
+// Blank out every `#[cfg(test)] mod name { ... }` block (input already comment-stripped), keeping
+// newlines so line numbers hold. The edges this script checks are what the SERVICE does at runtime;
+// a test's own stand-in server and HTTP client are not routes or outbound calls of the prover.
+// Braces inside string and char literals are skipped, so `format!("{}", x)` cannot unbalance it.
+function stripTestModules(code) {
+  const blank = (s) => s.replace(/[^\n]/g, ' ');
+  let out = code;
+  for (const m of [...code.matchAll(/#\[cfg\(test\)\]\s*mod\s+[A-Za-z_][A-Za-z0-9_]*\s*\{/g)].reverse()) {
+    let i = m.index + m[0].length;
+    let depth = 1;
+    while (i < code.length && depth > 0) {
+      const c = code[i];
+      const prev = code[i - 1] ?? '';
+      if (c === 'r' && /^r#*"/.test(code.slice(i, i + 10)) && (prev === 'b' || !/[A-Za-z0-9_]/.test(prev))) {
+        const hashes = code.slice(i + 1).match(/^#*/)[0];
+        const end = code.indexOf('"' + hashes, i + 2 + hashes.length);
+        i = end === -1 ? code.length : end + 1 + hashes.length;
+      } else if (c === '"') {
+        i++;
+        while (i < code.length && code[i] !== '"') { if (code[i] === '\\') i++; i++; }
+        i++;
+      } else if (c === "'" && /^'(\\.|[^\\'\n])'/.test(code.slice(i, i + 4))) {
+        i += code.slice(i).match(/^'(\\.|[^\\'\n])'/)[0].length;
+      } else {
+        if (c === '{') depth++;
+        else if (c === '}') depth--;
+        i++;
+      }
+    }
+    out = out.slice(0, m.index) + blank(out.slice(m.index, i)) + out.slice(i);
+  }
+  return out;
+}
+
 function section(md, heading) {
   const start = md.indexOf(`\n${heading}\n`);
   if (start === -1) return null;
@@ -122,9 +157,9 @@ if (results.some((r) => r.outcome === 'FAILED')) finish();
 
 const readme = read(README_PATH);
 const mainRaw = read(MAIN_PATH);
-const main = stripRustComments(mainRaw);
+const main = stripTestModules(stripRustComments(mainRaw));
 const srcFiles = readdirSync(SRC_DIR).filter((f) => f.endsWith('.rs')).map((f) => join(SRC_DIR, f));
-const srcs = srcFiles.map((p) => ({ path: p, raw: read(p), code: stripRustComments(read(p)) }));
+const srcs = srcFiles.map((p) => ({ path: p, raw: read(p), code: stripTestModules(stripRustComments(read(p))) }));
 
 // ---------------------------------------------------------------------------------------------
 // Code side: the router
@@ -132,7 +167,7 @@ const srcs = srcFiles.map((p) => ({ path: p, raw: read(p), code: stripRustCommen
 const routeRe = new RegExp(String.raw`\.route\(\s*"([^"]+)"\s*,\s*(get|post|put|patch|delete|head)\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)\s*\)`, 'g');
 const codeRoutes = [];
 for (const m of main.matchAll(routeRe)) {
-  codeRoutes.push({ method: m[2].toUpperCase(), path: m[1], handler: m[3], line: lineOf(main, m.index) });
+  codeRoutes.push({ method: m[2].toUpperCase(), path: m[1], handler: m[3], line: lineOf(main, m.index), index: m.index });
 }
 const routeCalls = [...main.matchAll(/\.route\(/g)].length;
 if (routeCalls !== codeRoutes.length || codeRoutes.length === 0) {
@@ -222,6 +257,34 @@ if (!endpoints || readmeRows.length === 0) {
       }
     }
   }
+
+  // Auth (F-10). The README's "Auth" column must match PUBLIC_PATHS in main.rs: "Public" for
+  // those paths, "Bearer token" for every other row. And the auth layer must come AFTER every
+  // .route(, because axum applies .layer only to routes added before it: a route added below the
+  // layer would be served without a token while this table still said "Bearer token".
+  const AUTH_CHECK = 'README "Auth" column matches main.rs, and the auth layer wraps every route';
+  const pub = main.match(/const\s+PUBLIC_PATHS\s*:\s*&\[\s*&(?:'static\s+)?str\s*\]\s*=\s*&\[([^\]]*)\]/);
+  const layer = [...main.matchAll(/\.layer\(\s*middleware::from_fn_with_state\([^;]*?require_bearer\s*\)\s*\)/g)];
+  const authProblems = [];
+  if (!pub) authProblems.push('const PUBLIC_PATHS not found in main.rs');
+  if (!/env::var\(\s*"PROVER_AUTH_TOKEN"\s*\)/.test(main)) authProblems.push('main.rs does not read PROVER_AUTH_TOKEN');
+  if (layer.length !== 1) authProblems.push(`expected one .layer(middleware::from_fn_with_state(.., require_bearer)) in main.rs, found ${layer.length}`);
+  const publicPaths = new Set(pub ? [...pub[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]) : []);
+  if (pub) {
+    for (const p of publicPaths) if (!codePaths.has(p)) authProblems.push(`PUBLIC_PATHS names ${p}, which main.rs does not route`);
+    for (const row of readmeRows) {
+      const cell = row.text.split('|')[0].trim();
+      const want = publicPaths.has(row.path) ? 'Public' : 'Bearer token';
+      if (cell !== want) authProblems.push(`README row ${routeKey(row)} says "${cell}" in the Auth column; main.rs makes it "${want}"`);
+    }
+  }
+  if (layer.length === 1) {
+    for (const r of codeRoutes) {
+      if (r.index > layer[0].index) authProblems.push(`main.rs:${r.line} ${routeKey(r)} is added after the auth layer (main.rs:${lineOf(main, layer[0].index)}), so it is served without a token`);
+    }
+  }
+  if (authProblems.length) failed(AUTH_CHECK, authProblems.join('; '));
+  else verified(AUTH_CHECK, `public: ${[...publicPaths].join(', ')}; every other route needs the bearer token; auth layer at main.rs:${lineOf(main, layer[0].index)}, after all ${codeRoutes.length} routes`);
 }
 
 // Every inline `METHOD /path` anywhere in the README must be a real route.
