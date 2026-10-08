@@ -35,19 +35,38 @@ One statement per request: **`repid_score > threshold`, for one `agent_id`**
 
 `cargo test` in `services/zkp-postcard` runs the circuit tests: a round trip, a proof rejected
 under another agent's id, a proof rejected under an inflated score, the boundary
-`repid_score = threshold + 1`, and forged wrapped gaps.
+`repid_score = threshold + 1`, and forged wrapped gaps. It also runs HTTP tests against the real
+router: `verified` is `false` whenever there is no proof, a protected route answers `401` without
+the right token and `503` with no token configured, `/health` stays public, and the verify route
+is gone.
 
 ## HTTP endpoints
 
-These are the routes in `services/zkp-postcard/src/main.rs`. There is no authentication, and CORS
-allows any origin (`CorsLayer::permissive()`).
+These are the routes in `services/zkp-postcard/src/main.rs`. Every route except `/health` needs a
+bearer token (see [Authentication](#authentication)). CORS allows any origin
+(`CorsLayer::permissive()`).
 
-| Method | Path | What it does |
-|---|---|---|
-| `GET` | `/health` | Fixed JSON (`status`, `service`, `version`, `proof_types`, `protocol`). It does not contact Supabase. |
-| `POST` | `/zkp/repid-proof` | Produces a proof. The request and response are described below. |
-| `POST` | `/prove/trade_auth` | **The same handler as `/zkp/repid-proof`.** It produces the RepID range proof described above, not a trade-authorization proof. This repository has no trade-authorization circuit. |
-| `GET` | `/zkp/verify/{commitment}` | **This route does not work in the current build** (see the note below). |
+| Method | Path | Auth | What it does |
+|---|---|---|---|
+| `GET` | `/health` | Public | Fixed JSON (`status`, `service`, `version`, `proof_types`, `protocol`, `auth_configured`). It does not contact Supabase. |
+| `POST` | `/zkp/repid-proof` | Bearer token | Produces a proof. The request and response are described below. |
+| `POST` | `/prove/trade_auth` | Bearer token | **The same handler as `/zkp/repid-proof`.** It produces the RepID range proof described above, not a trade-authorization proof. This repository has no trade-authorization circuit. |
+
+### Authentication
+
+Every route except `/health` requires the header `Authorization: Bearer <token>`, where the token
+must equal the service's `PROVER_AUTH_TOKEN` environment variable. The service compares the two in
+constant time and never logs or returns the token or the header.
+
+- **`PROVER_AUTH_TOKEN` unset or empty: `503 {"error":"auth_not_configured"}`** on every route
+  except `/health`. The service fails closed. It never serves a protected route without a token.
+- **Token missing or wrong: `401 {"error":"unauthorized"}`** with `WWW-Authenticate: Bearer`.
+- The check runs before the handler, so a refused request causes no Supabase read and no proving.
+- `/health` stays public, because DealAppSeo/trinity-symphony-shared's pulse check calls it with no
+  credentials. It reports `auth_configured: true|false`, never the token.
+
+Before 2026-10-07 the service had no authentication, so anyone could read any agent's score and
+tier through it.
 
 ### `POST /zkp/repid-proof`
 
@@ -62,29 +81,30 @@ The request body is JSON:
 - `requester_pubkey` and `timestamp` are accepted and not used.
 - If the agent is unknown, the service returns `404 {"error":"agent_not_found"}`. If the Supabase
   read fails, it returns `500 {"error":"internal_error"}`.
+- Without a valid token it returns `401`, and `503` if the service has no token configured
+  (see [Authentication](#authentication)).
 
 Check `proof_type` in the response before reading any other field:
 
 | `proof_type` | Meaning |
 |---|---|
-| `plonky3_range_check` | A real STARK proof in `proof_bytes`, with `poseidon2_leaf` set. |
-| `sha256_commitment_poc` | **No proof.** `proof_bytes` holds a placeholder string. The service returns this type when the score is not above the threshold, or when proving failed. |
+| `plonky3_range_check` | A real STARK proof in `proof_bytes`, with `poseidon2_leaf` set. `verified` is `true`. |
+| `sha256_commitment_poc` | **No proof.** `proof_bytes` holds a placeholder string. `verified` is `false`, and `reason` says why: `not_above_threshold` or `proving_failed`. |
 
-`verified` is the result of comparing `repid_score > threshold`. It does not mean `proof_bytes`
-was verified. It is `true` on the `sha256_commitment_poc` path when proving failed, so a `true`
-value does not mean a proof exists. `erc8004_token_id` is a copy of `agent_id`.
+`verified` is `true` only when the response carries a real proof, which the service verified
+before returning it. On both no-proof paths it is `false`, and the HTTP status is still `200`.
+`reason` is `null` on a real proof. Until 2026-10-07, `verified` was the comparison
+`repid_score > threshold`, so it said `true` when proving failed and no proof existed.
+`erc8004_token_id` is a copy of `agent_id`.
 
-### `GET /zkp/verify/{commitment}`: this route does not work in the current build
+### No verify route
 
-The path uses axum 0.8's `{param}` syntax. The crate depends on `axum = "0.7"` (`Cargo.lock`
-pins 0.7.9), and in that version braces are literal characters. VERIFIED on 2026-10-07 by
-running a binary built from this repository with `--locked`: a request for a commitment the same
-process had just returned got 404. A request for the literal path `/zkp/verify/{commitment}`
-got 500. Not checked against the live service.
-
-If the route worked, it would still only look up an in-memory map of the proofs this process
-has made since it last started, and return the stored comparison result. It does not
-re-verify proof bytes.
+The verify route, `/zkp/verify/{commitment}`, was removed on 2026-10-07. It never routed: it used axum 0.8's
+`{param}` syntax, and `Cargo.lock` pins axum 0.7.9, where braces are literal characters. It also
+could not have checked anything. It read a stored `repid_score > threshold` flag from an
+in-process map that held neither the proof bytes nor the score, and the map was emptied at every
+restart. To verify a proof, run the independent verifier `@hyperdag/proof-verifier` on
+`proof_bytes` and the statement `{agent_id, threshold, repid_score}`.
 
 ## Where this sits
 
@@ -95,8 +115,7 @@ re-verify proof bytes.
   The base URL comes from `SUPABASE_URL`. The key comes from `SUPABASE_SECRET_KEY`, or
   `SUPABASE_SERVICE_KEY`, or `SUPABASE_SERVICE_ROLE_KEY`, in that order of preference.
 - The service makes no other calls at runtime. It does not call repid-engine, does not write to
-  Supabase or to any other store, does not send anything on-chain, and keeps proof records in
-  process memory only.
+  Supabase or to any other store, does not send anything on-chain, and keeps no proof records.
 
 **Called by:**
 
@@ -104,10 +123,15 @@ re-verify proof bytes.
   and its proof-drain worker call `POST /zkp/repid-proof` at
   `https://zkp-postcard-production.up.railway.app`. That URL is the engine's default when its
   `ZKP_SERVICE_URL` is unset.
-- This README names no caller of `/prove/trade_auth`, `/zkp/verify/{commitment}` or `/health`.
-  NOT CHECKED: the engine's trade-authorization bridge would send its request to
+- Every one of those calls must now send the bearer token. As of 2026-10-07 the engine sends
+  none, so this change must not reach production before the engine sends it (see
+  [Build and deploy](#build-and-deploy)).
+- DealAppSeo/trinity-symphony-shared's pulse check calls `/health` with no token.
+- NOT CHECKED: the engine's trade-authorization bridge would send its request to
   `/prove/trade_auth` here if the engine's `PLONKY3_PROVER_URL` or `ZKP_SERVICE_URL` pointed at
-  this service. Nobody has checked whether either variable is set.
+  this service. Nobody has checked whether either variable is set. Its request body carries
+  `timestamp` as an ISO string, and this service declares `timestamp` as an integer, so a local
+  build answers that body with `422`.
 
 **The whole map:** [How the pieces fit](https://github.com/DealAppSeo/hyperdag-protocol/blob/main/BUILDERS.md#how-the-pieces-fit),
 in DealAppSeo/hyperdag-protocol.
@@ -127,21 +151,31 @@ in DealAppSeo/hyperdag-protocol.
   revision. It pulls `babybear-leaf` from this repository over git at a pinned `rev`, not as a
   path dependency, because the Docker build context stops at `services/zkp-postcard`. A change
   to `services/babybear-leaf` therefore reaches the prover only when that `rev` is bumped.
+- **Deploy order for authentication.** A deployed build with no `PROVER_AUTH_TOKEN` answers `503`
+  to every proof request, and one with a token answers `401` to any caller that does not send it.
+  Either way no proofs are made. So the engine must send the token first (a header the old build
+  ignores is harmless), the same token value must be set on both services, and only then may this
+  build be deployed. After deploying, `/health` should report `auth_configured: true`.
 
 ## Run it locally
 
 The binary panics at startup unless `SUPABASE_URL` and one of the three key variables are set.
 Every proof request reads the agent's score from that URL, so the service has no offline mode.
 For local work, any HTTP server that answers the one query above with
-`[{"current_repid": <n>, "tier": "<TIER>"}]` is enough.
+`[{"current_repid": <n>, "tier": "<TIER>"}]` is enough. Without `PROVER_AUTH_TOKEN` the service
+starts, and every route except `/health` answers `503`.
 
 ```bash
 cd services/zkp-postcard
 export SUPABASE_URL="https://<your-project>.supabase.co"
 export SUPABASE_SECRET_KEY="<server-side key>"     # never commit a key
+export PROVER_AUTH_TOKEN="<a long random value>"   # never commit it either
 cargo run --release                                  # listens on 0.0.0.0:$PORT, default 8080
 curl -s localhost:8080/health
-cargo test                                           # circuit tests; needs no environment
+curl -s -X POST localhost:8080/zkp/repid-proof \
+  -H "Authorization: Bearer $PROVER_AUTH_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"agent_id":"<agent uuid>"}'
+cargo test --locked                                  # circuit and HTTP tests; needs no environment
 ```
 
 PowerShell:
@@ -150,6 +184,7 @@ PowerShell:
 cd services\zkp-postcard
 $env:SUPABASE_URL = "https://<your-project>.supabase.co"
 $env:SUPABASE_SECRET_KEY = "<server-side key>"
+$env:PROVER_AUTH_TOKEN = "<a long random value>"
 cargo run --release
 ```
 
@@ -178,11 +213,17 @@ node scripts/check-readme-edges.mjs
 This script checks the edges named above against the code, with no dependencies. It checks:
 
 - Every route this README lists matches the router in `main.rs`, in both directions.
+- The *Auth* column matches `PUBLIC_PATHS` in `main.rs`, and the auth layer is applied after
+  every route, so no route can be served without the token while this table says it needs one.
 - The *Calls* list matches the outbound requests in `services/zkp-postcard/src/`.
 - Every environment variable the code reads is named here.
 - The only deployment domain named here is the one the engine calls.
 - The map link is present.
-- The `/zkp/verify` note still matches the pinned axum version.
+- Any route using axum 0.8 `{param}` syntax is marked as not working while `Cargo.lock` pins
+  axum below 0.8.
+
+Code inside `#[cfg(test)]` modules is skipped: the tests' stand-in server and client are not
+edges of the running service.
 
 If `REPID_ENGINE_DIR` points at a checkout of DealAppSeo/repid-engine, the script also checks the
 *Called by* edge against the engine's source.
