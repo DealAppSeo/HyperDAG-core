@@ -3,3 +3,6 @@ target_v2/
 *.json
 *.log
 .env
+
+# zvec-grep local semantic index (rebuild: npm run search:index)
+.zvec-grep/
