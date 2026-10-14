@@ -37,4 +37,6 @@ jobs:
         working-directory: services/zkp-postcard
         run: docker build --progress=plain -t zkp-postcard:ci -f Dockerfile .
       - name: binary is present in the runtime image
-        run: docker run --rm --entrypoint /bin/sh zkp-postcard:ci -c 'test -x /usr/local/bin/zkp-postcard && echo "OK: zkp-postcard binary present"'
+        run: |
+          docker run --rm --entrypoint /bin/sh zkp-postcard:ci -c 'test -x /usr/local/bin/zkp-postcard'
+          echo 'OK - zkp-postcard binary present in the runtime image'
