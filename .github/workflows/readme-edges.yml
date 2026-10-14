@@ -19,10 +19,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Check out the caller (DealAppSeo/repid-engine, src/ only, read-only)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: DealAppSeo/repid-engine
           path: _repid-engine
