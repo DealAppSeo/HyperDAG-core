@@ -1,0 +1,40 @@
+name: prover-build
+
+# Builds the zkp-postcard prover image exactly as Railway does (services/zkp-postcard/Dockerfile,
+# build context = that directory). Without this, a toolchain change (a moved base-image tag) is
+# first discovered as a failed production deploy, which is what happened on 2026-10-11.
+#
+# Path-filtered to the prover so unrelated PRs do not pay for a Plonky3 release build.
+
+on:
+  pull_request:
+    paths:
+      - 'services/zkp-postcard/**'
+      - '.github/workflows/prover-build.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'services/zkp-postcard/**'
+      - '.github/workflows/prover-build.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prover-build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: docker build zkp-postcard
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: build the prover image (no push)
+        working-directory: services/zkp-postcard
+        run: docker build --progress=plain -t zkp-postcard:ci -f Dockerfile .
+      - name: binary is present in the runtime image
+        run: docker run --rm --entrypoint /bin/sh zkp-postcard:ci -c 'test -x /usr/local/bin/zkp-postcard && echo "OK: zkp-postcard binary present"'
