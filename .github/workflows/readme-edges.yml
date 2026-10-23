@@ -38,3 +38,6 @@ jobs:
         env:
           REPID_ENGINE_DIR: _repid-engine
         run: node scripts/check-readme-edges.mjs
+
+      - name: Self-test the checker
+        run: node scripts/check-readme-edges.test.mjs
