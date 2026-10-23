@@ -2,6 +2,8 @@
 ## Hallucination Assessment Layer — Technical Specification
 ### HyperDAG Protocol | Version 1.0 | April 2026
 
+> **Historical snapshot (April 2026).** This is the original HAL methodology write-up. Its status note, the results in section 6 and the roadmap in section 7 were written on or about 2026-04-21. They are **not current**, were not re-measured for this notice, and the roadmap dates were never tracked here. Nothing in this document describes the prover in this repository. How the pieces fit, and where current figures live: [BUILDERS.md](https://github.com/DealAppSeo/hyperdag-protocol/blob/main/BUILDERS.md).
+
 ---
 
 ## A Note to the Community
@@ -32,7 +34,7 @@ on a chromatic circle and accumulate dissonance against this
 mathematical constant. When dissonance exceeds the threshold
 derived from the Pythagorean Comma gap, the system issues a veto.
 
-**Current status:** Baseline established. Zero false positive vetoes
+**Status on 2026-04-21 (historical, not current):** Baseline established. Zero false positive vetoes
 across 316 production decisions. The veto threshold has not yet
 fired — the 5-signal calibration work described here is the active
 development frontier. We publish the baseline honestly.
@@ -193,6 +195,8 @@ Python training: `py-brain` Railway service (ANFIS + LASSO)
 
 ## 6. Baseline Results — April 21, 2026
 
+*Snapshot of 2026-04-21 (33 agents, 316 scored decisions at that date). Not current; not re-measured here.*
+
 | Metric | Value | Notes |
 |--------|-------|-------|
 | Total decisions scored | 316 | Production, 33 agents |
@@ -219,6 +223,8 @@ rate reflects an uncalibrated threshold, not a broken system.
 ---
 
 ## 7. Calibration Roadmap
+
+*Plan as of April 2026. This repository does not track whether these targets were met.*
 
 **Phase 1 (Current):** Baseline established. 5-signal extractor deployed.
 
