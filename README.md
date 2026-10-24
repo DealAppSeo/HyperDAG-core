@@ -1,8 +1,10 @@
 # HyperDAG-core
 
+**Part of the HyperDAG trust stack.** This repository is the proof-generating service for RepID. It turns one statement, that an agent's RepID score is above a threshold, into a Plonky3 STARK proof, and it does not compute RepID scores, store proofs or write to any chain. How the pieces fit: [BUILDERS.md](https://github.com/DealAppSeo/hyperdag-protocol/blob/main/BUILDERS.md). Credits and licences: [ACKNOWLEDGEMENTS.md](https://github.com/DealAppSeo/hyperdag-protocol/blob/main/ACKNOWLEDGEMENTS.md). Test network only (Base Sepolia).
+
 **This repository is the prover.** `services/zkp-postcard` is the HTTP service that
 [DealAppSeo/repid-engine](https://github.com/DealAppSeo/repid-engine) calls to produce its
-Plonky3 STARK proofs: a range proof that one agent's RepID score is above a threshold.
+[Plonky3](https://github.com/Plonky3/Plonky3) (by Polygon Labs) STARK proofs: a range proof that one agent's RepID score is above a threshold.
 It is deployed as one Railway service, `zkp-postcard`, at
 `https://zkp-postcard-production.up.railway.app`.
 
@@ -23,7 +25,7 @@ One statement per request: **`repid_score > threshold`, for one `agent_id`**
   recombine to `repid_score - threshold - 1` computed from the public values. When the score is
   not above the threshold, the gap wraps to a large field element that does not fit in 16 bits,
   so no valid proof exists. This assumes `repid_score - threshold < 65536`.
-- **Proof system.** Plonky3 `uni-stark` over BabyBear with a degree-4 extension field, Keccak-256
+- **Proof system.** [Plonky3](https://github.com/Plonky3/Plonky3) (Polygon Labs; Apache-2.0 and MIT) `uni-stark` over BabyBear with a degree-4 extension field, Keccak-256
   Merkle commitments, and FRI with the parameters set in `prove_range_check`. This README makes
   no claim about soundness level.
 - The service verifies each proof itself before returning it, serializes it with `bincode`, and
@@ -31,7 +33,7 @@ One statement per request: **`repid_score > threshold`, for one `agent_id`**
 - **Two more values in each response. The circuit checks neither of them.**
   `commitment` is `0x` followed by the SHA-256 of `hyperdag_v1:{agent_id}:{repid_score}:{threshold}`.
   For real proofs only, `poseidon2_leaf` is one BabyBear element hashing the same statement with
-  the Poseidon2 permutation from `services/babybear-leaf` (`leaf_scheme: "poseidon2_babybear"`).
+  the [Poseidon2](https://eprint.iacr.org/2023/323) permutation (Grassi, Khovratovich and Schofnegger), as implemented in Plonky3, from `services/babybear-leaf` (`leaf_scheme: "poseidon2_babybear"`).
 
 `cargo test` in `services/zkp-postcard` runs the circuit tests: a round trip, a proof rejected
 under another agent's id, a proof rejected under an inflated score, the boundary
@@ -123,9 +125,12 @@ restart. To verify a proof, run the independent verifier `@hyperdag/proof-verifi
   and its proof-drain worker call `POST /zkp/repid-proof` at
   `https://zkp-postcard-production.up.railway.app`. That URL is the engine's default when its
   `ZKP_SERVICE_URL` is unset.
-- Every one of those calls must now send the bearer token. As of 2026-10-07 the engine sends
-  none, so this change must not reach production before the engine sends it (see
-  [Build and deploy](#build-and-deploy)).
+- Every one of those calls must send the bearer token, and the engine's code does: each call site spreads
+  `proverAuthHeaders()` (`src/config/prover.ts:82-91` in repid-engine), which sends
+  `Authorization: Bearer <ZKP_SERVICE_TOKEN>` when that variable is set. The deployed prover's
+  `/health` reports `auth_configured: true` (checked 2026-10-23). NOT CHECKED: whether the engine's
+  production environment has `ZKP_SERVICE_TOKEN` set, and equal to this service's
+  `PROVER_AUTH_TOKEN` (see [Build and deploy](#build-and-deploy)).
 - DealAppSeo/trinity-symphony-shared's pulse check calls `/health` with no token.
 - NOT CHECKED: the engine's trade-authorization bridge would send its request to
   `/prove/trade_auth` here if the engine's `PLONKY3_PROVER_URL` or `ZKP_SERVICE_URL` pointed at
@@ -147,15 +152,16 @@ in DealAppSeo/hyperdag-protocol.
   with root directory `services/zkp-postcard` and the Dockerfile
   (`services/zkp-postcard/railway.toml`). Its public domain is
   `zkp-postcard-production.up.railway.app`.
-- **Dependencies.** `services/zkp-postcard/Cargo.toml` pins every Plonky3 crate to one git
+- **Dependencies.** `services/zkp-postcard/Cargo.toml` pins every [Plonky3](https://github.com/Plonky3/Plonky3) crate to one git
   revision. It pulls `babybear-leaf` from this repository over git at a pinned `rev`, not as a
   path dependency, because the Docker build context stops at `services/zkp-postcard`. A change
   to `services/babybear-leaf` therefore reaches the prover only when that `rev` is bumped.
-- **Deploy order for authentication.** A deployed build with no `PROVER_AUTH_TOKEN` answers `503`
-  to every proof request, and one with a token answers `401` to any caller that does not send it.
-  Either way no proofs are made. So the engine must send the token first (a header the old build
-  ignores is harmless), the same token value must be set on both services, and only then may this
-  build be deployed. After deploying, `/health` should report `auth_configured: true`.
+- **Authentication (rolled out; keep this order for any change to the token).** A deployed build
+  with no `PROVER_AUTH_TOKEN` answers `503` to every proof request, and one with a token answers
+  `401` to any caller that does not send it. Either way no proofs are made. So the engine must send
+  the token first (a header the old build ignores is harmless), the same token value must be set on
+  both services, and only then may the prover be deployed. `/health` should report
+  `auth_configured: true`; on 2026-10-23 it does.
 
 ## Run it locally
 
@@ -194,7 +200,7 @@ The Dockerfile uses a nightly toolchain. On 2026-10-07, `cargo build --locked` a
 ## Other folders
 
 - `services/babybear-leaf/` is a Rust crate with the Poseidon2/BabyBear hash that the prover uses
-  for `poseidon2_leaf`. It also contains known-answer test vectors, a `leaf` command-line binary,
+  for `poseidon2_leaf` (Plonky3's `default_babybear_poseidon2_16`, from the Poseidon2 design linked above). It also contains known-answer test vectors, a `leaf` command-line binary,
   wasm-bindgen exports, and fold circuits (`fold.rs`, `fold_c1.rs`) that the prover does not call.
 - `migrations/` holds one SQL migration. It adds a `domain` column to `zkp_circuits` and
   leaf-lineage columns to `repid_zkp_proofs`. Its header marks it DRAFT, and this repository does
@@ -231,6 +237,15 @@ If `REPID_ENGINE_DIR` points at a checkout of DealAppSeo/repid-engine, the scrip
 Exit codes: `0` VERIFIED, `1` FAILED, `2` NOT CHECKED. `2` means nothing failed but at least one
 check could not run. `.github/workflows/readme-edges.yml` runs the script on every pull request
 with the engine checked out.
+
+## Credits
+
+- [Plonky3](https://github.com/Plonky3/Plonky3), by Polygon Labs (Apache-2.0 and MIT): the proof
+  system and the field, hash, FRI and Merkle-tree crates this prover is built from.
+- [Poseidon2](https://eprint.iacr.org/2023/323), by Lorenzo Grassi, Dmitry Khovratovich and Markus
+  Schofnegger: the hash design behind `poseidon2_leaf`.
+- Credits and licences for the whole stack:
+  [ACKNOWLEDGEMENTS.md](https://github.com/DealAppSeo/hyperdag-protocol/blob/main/ACKNOWLEDGEMENTS.md).
 
 ## License
 

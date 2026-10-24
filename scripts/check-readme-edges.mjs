@@ -35,6 +35,10 @@ const WHERE_HEADING = '## Where this sits';
 const PARTS = ['**Calls:**', '**Called by:**', '**The whole map:**'];
 const METHODS = 'GET|POST|PUT|PATCH|DELETE|HEAD';
 
+// A loopback URL in the engine's source (for example the LOCAL_MODE log message in src/config/prover.ts)
+// is not a prover deployment, so it is not drift. Any other host on a prover line still is.
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
+
 // Outbound mechanisms other than the reqwest client. If any of these appears in the source,
 // the README's "Calls" list cannot be complete, so the checker fails rather than guessing.
 const OTHER_OUTBOUND = [
@@ -428,7 +432,9 @@ if (!engineDir) {
         for (const m of line.matchAll(re)) { builtPaths.push({ path: m[1], file: relp, where }); buildsPath = true; }
       }
       if (buildsPath || /prover|ZKP_SERVICE_URL/i.test(line)) {
-        for (const m of line.matchAll(/https?:\/\/([A-Za-z0-9.\-]+)/g)) proverLiterals.push({ host: m[1], where });
+        for (const m of line.matchAll(/https?:\/\/(\[[0-9A-Fa-f:]+\]|[A-Za-z0-9.\-]+)/g)) {
+          if (!LOOPBACK_HOSTS.has(m[1])) proverLiterals.push({ host: m[1], where });
+        }
       }
     });
   }
