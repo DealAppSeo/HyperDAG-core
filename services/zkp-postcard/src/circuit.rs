@@ -387,20 +387,29 @@ mod tests {
     /// by `eval`, so only the trace and the public values decide the outcome.
     fn trace_forgery_fails(agent: &str, threshold: u64, repid: u64, trace: RowMajorMatrix<BabyBear>) -> bool {
         use std::panic;
+        // Setup runs OUTSIDE the catch: a setup failure must fail the test, not count as a rejection.
+        // (Codex review of 328cfac: the old helper caught every panic, so an unrelated failure read as "forgery rejected".)
+        let config = test_config!();
+        let air = RepIdRangeCheckAir { value: 0 };
+        let pv = build_public_values(agent, threshold, repid).unwrap();
         let prev = panic::take_hook();
-        panic::set_hook(Box::new(|_| {})); // silence the expected unsatisfiable-constraint panic
-        let out = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            let config = test_config!();
-            let air = RepIdRangeCheckAir { value: 0 };
-            let pv = build_public_values(agent, threshold, repid).unwrap();
-            let proof = prove(&config, &air, trace, &pv);
-            verify(&config, &air, &proof, &pv)
-        }));
+        panic::set_hook(Box::new(|_| {})); // silence the expected debug-build constraint panic
+        let proved = panic::catch_unwind(panic::AssertUnwindSafe(|| prove(&config, &air, trace, &pv)));
         panic::set_hook(prev);
-        match out {
-            Err(_) => true,       // prover could not satisfy constraints
-            Ok(Err(_)) => true,   // verifier rejected
-            Ok(Ok(())) => false,  // FORGERY ACCEPTED — soundness broken
+        match proved {
+            // Under debug_assertions, `prove` runs p3-air `check_constraints`, which refuses an unsatisfiable trace with exactly
+            // this panic (p3-air check_constraints.rs at the pinned rev). That is a real rejection. Any other panic, or any panic in
+            // a release build (no constraint check while proving), is not: fail loudly. (Codex review of efd0814: the first
+            // version counted every debug-build panic as a rejection.)
+            Err(p) => {
+                let msg = p.downcast_ref::<String>().map(String::as_str).or_else(|| p.downcast_ref::<&str>().copied()).unwrap_or("");
+                assert!(
+                    cfg!(debug_assertions) && msg.starts_with("constraints not satisfied on row"),
+                    "prove panicked, and not with Plonky3's debug constraint check (release build, or another failure): {msg}"
+                );
+                true
+            }
+            Ok(proof) => verify(&config, &air, &proof, &pv).is_err(), // false = FORGERY ACCEPTED, soundness broken
         }
     }
 
@@ -468,5 +477,15 @@ mod tests {
             trace_forgery_fails(AGENT_A, 1000, 1000, RowMajorMatrix::new(row, 32)),
             "a non-boolean bit summing to -1 MUST fail"
         );
+    }
+
+    #[test]
+    fn test_forgery_helper_does_not_swallow_a_setup_failure() {
+        // build_public_values refuses a value >= 2^31. That must surface as its own panic, not as "forgery rejected" and not
+        // as the helper's "prove panicked" assertion (which is what a setup moved back inside the catch would produce).
+        let r = std::panic::catch_unwind(|| trace_forgery_fails(AGENT_A, 1u64 << 31, 0, generate_trace::<BabyBear>(0)));
+        let p = r.expect_err("a setup failure must panic, not return a verdict");
+        let msg = p.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(msg.contains("must be < 2^31") && !msg.contains("prove panicked"), "setup failure must surface directly: {msg}");
     }
 }
