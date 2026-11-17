@@ -75,10 +75,13 @@ impl<AB: AirBuilder> Air<AB> for RepIdRangeCheckAir where AB::F: Field {
         let main = builder.main();
         let row = main.current_slice();
 
-        // 16-bit range check (soundness fix, 2026-06-08). The gap must be < 2^16. The high
-        // 16 bits (row[0..16] = the 2^16..2^31 places, big-endian) are forced to ZERO, so a
-        // "negative" gap (repid <= threshold), which is (repid-threshold-1) mod p ~= 2^31 with
-        // high bits set, cannot be represented and verification fails. A 31-bit range over
+        // 16-bit range check (soundness fix, 2026-06-08). The gap must be < 2^16. What enforces
+        // it is the reconstruction below: the gap is rebuilt from exactly 16 columns, each forced
+        // boolean, so it lies in [0, 2^16). A "negative" gap (repid <= threshold) is
+        // (repid-threshold-1) mod p, close to p, so no 16 boolean bits can equal it. The zeroing
+        // of row[0..16] just below is redundant: those columns appear in no other constraint, so
+        // removing it changes nothing (an equivalent mutant, found by the ops ZK ruler on
+        // 2026-11-17). This comment used to credit soundness to it. A 31-bit range over
         // BabyBear (p = 2^31 - 2^27 + 1) was unsound: ~the whole field is representable, so a
         // wrapped negative gap (e.g. -1 == p-1 == 2013265920 < 2^31) satisfied the equality.
         // ASSUMPTION: repid - threshold < 65536. True for RepID (repid <= 10000, threshold >= 0
@@ -377,13 +380,18 @@ mod tests {
     /// Returns true iff the forgery FAILS — either the prover cannot build it (constraints
     /// unsatisfiable → panic under debug_assertions) or the verifier rejects it.
     fn forgery_fails(agent: &str, threshold: u64, repid: u64, malicious_gap: u32) -> bool {
+        trace_forgery_fails(agent, threshold, repid, generate_trace::<BabyBear>(malicious_gap))
+    }
+
+    /// The same, with a trace the attacker writes by hand. `RepIdRangeCheckAir::value` is not read
+    /// by `eval`, so only the trace and the public values decide the outcome.
+    fn trace_forgery_fails(agent: &str, threshold: u64, repid: u64, trace: RowMajorMatrix<BabyBear>) -> bool {
         use std::panic;
         let prev = panic::take_hook();
         panic::set_hook(Box::new(|_| {})); // silence the expected unsatisfiable-constraint panic
         let out = panic::catch_unwind(panic::AssertUnwindSafe(|| {
             let config = test_config!();
-            let air = RepIdRangeCheckAir { value: malicious_gap };
-            let trace = generate_trace::<BabyBear>(malicious_gap);
+            let air = RepIdRangeCheckAir { value: 0 };
             let pv = build_public_values(agent, threshold, repid).unwrap();
             let proof = prove(&config, &air, trace, &pv);
             verify(&config, &air, &proof, &pv)
@@ -438,6 +446,27 @@ mod tests {
         assert!(
             forgery_fails(AGENT_A, threshold, repid, wrapped),
             "repid < threshold MUST fail"
+        );
+    }
+
+    #[test]
+    fn test_in_range_gap_with_lying_statement_fails() {
+        // Value binding. Gap 0 is a valid 16-bit value, but the statement says repid == threshold.
+        // Only `reconstructed == repid - threshold - 1` rejects this. Every wrapped-gap test above
+        // is caught by the range check first, so none of them would notice that constraint missing.
+        assert!(forgery_fails(AGENT_A, 1000, 1000, 0), "an in-range gap with repid == threshold MUST fail");
+        assert!(forgery_fails(AGENT_A, 1000, 600, 0), "an in-range gap with repid < threshold MUST fail");
+    }
+
+    #[test]
+    fn test_non_boolean_bit_forgery_fails() {
+        // Boolean bits. A forger writing the trace by hand puts -1 (= p-1) in the 2^0 column, so the
+        // 16-bit sum is -1 = repid - threshold - 1 for repid == threshold. Only assert_bool stops it.
+        let mut row = vec![BabyBear::ZERO; 32];
+        row[31] = -BabyBear::ONE;
+        assert!(
+            trace_forgery_fails(AGENT_A, 1000, 1000, RowMajorMatrix::new(row, 32)),
+            "a non-boolean bit summing to -1 MUST fail"
         );
     }
 }
