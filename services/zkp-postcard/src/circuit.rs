@@ -1,22 +1,24 @@
 use p3_challenger::{HashChallenger, SerializingChallenger32};
 use p3_air::WindowAccess;
-// Plonky3 STARK Range-Check Circuit for RepID Verification (agent-bound)
+// Plonky3 STARK Range-Check Circuit for RepID Verification
 //
-// Proves "RepID > threshold" for a SPECIFIC agent:
+// Proves a PUBLIC inequality: threshold < repid_score <= threshold + 2^16.
 //   gap = repid_score - threshold - 1
-//   prove(gap fits in u32)  =>  repid_score > threshold
+//   prove(gap fits in 16 bits: the high 16 of the 32 trace bits are forced to zero)
 //
-// Soundness (A1, the keystone):
-//   The statement is the public tuple {agent_id, threshold, repid_score}, exposed as
-//   circuit public values. Two binding properties hold:
-//     1. agent-binding  — agent_id (16 bytes) is in public_values, observed into the
-//        Fiat-Shamir transcript by both prover and verifier. A proof made for agent A
-//        FAILS verification under agent B's public values (different transcript). This
-//        is what makes a RepID proof non-replayable across agents.
-//     2. value-binding  — an AIR boundary constraint asserts the range-checked gap equals
-//        (repid_score - threshold - 1) drawn from public_values, so the proof actually
-//        attests "THIS agent's score exceeds THIS threshold," not merely "some 32-bit
-//        value exists."
+// What is and is not bound (corrected 2026-11-15; measured by repid-engine P-15, #1541):
+//   The statement is the public tuple {agent_id, threshold, repid_score}, and all three are
+//   public values. This is a validity proof, not a zero-knowledge one: the PCS below is the
+//   non-hiding TwoAdicFriPcs, and the proof hides nothing.
+//     1. value-binding  — an AIR boundary constraint asserts the range-checked gap equals
+//        (repid_score - threshold - 1) drawn from public_values. This holds.
+//     2. agent-binding  — WEAK. This header used to say a proof made for agent A FAILS
+//        under agent B's public values. agent_id sits in no constraint, only in the
+//        Fiat-Shamir transcript, so the 8-bit query proof-of-work is all that ties a proof
+//        to it: about 1 in 256 foreign agent ids verify the same proof bytes (10 of 3,072
+//        measured on 2026-11-13). Do not describe these proofs as agent-bound.
+//   Nothing in the proof says repid_score is the agent's real score. That binding, if any,
+//   lives outside this circuit.
 //
 // Field: BabyBear (p = 2^31 - 2^27 + 1)
 // Hash: Keccak256

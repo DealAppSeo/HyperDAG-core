@@ -1,10 +1,12 @@
 //! ZKP Postcard Service — HyperDAG Trust Protocol v1
 //!
 //! Proves "RepID > threshold" using a Plonky3 STARK range-check on BabyBear field.
-//! The circuit decomposes (repid - threshold - 1) into 32 bits and proves non-negativity.
+//! The circuit decomposes (repid - threshold - 1) into 32 trace bits, forces the high 16 to zero,
+//! and so proves threshold < score <= threshold + 2^16.
 //! The score is NOT a private input. The statement {agent_id, threshold, repid_score} is entirely
 //! public: all three are circuit public values, and the response returns the score as
-//! `repid_score_actual`. The proof binds "this agent's score > threshold"; it does not hide the score.
+//! `repid_score_actual`. The proof binds the score and threshold; it does not hide the score, and
+//! it binds agent_id only weakly (8-bit proof-of-work; see the header of circuit.rs).
 
 mod circuit;
 
@@ -330,8 +332,8 @@ async fn generate_proof(
 
     let start = Instant::now();
 
-    // Try a Plonky3 STARK proof. Agent-bound: the statement is the public tuple
-    // {agent_id, threshold, repid_score}. The closure runs only when `above`, so no underflow.
+    // Try a Plonky3 STARK proof of the public tuple {agent_id, threshold, repid_score}. agent_id
+    // is bound only weakly (see circuit.rs). The closure runs only when `above`, so no underflow.
     let outcome = proof_outcome(above, || {
         let diff = (repid - threshold - 1) as u32;
         circuit::prove_range_check(diff, &agent_id, threshold, repid)

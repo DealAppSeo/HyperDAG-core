@@ -18,8 +18,10 @@ One statement per request: **`repid_score > threshold`, for one `agent_id`**
 
 - **Public values.** 18 BabyBear field elements: the agent id as 16 bytes (a UUID's raw bytes;
   any other id is bound as the first 16 bytes of its SHA-256), then `threshold`, then
-  `repid_score`. All three are public. The proof binds the claim to that agent and that score.
-  It does not hide the score, and the HTTP response returns it as `repid_score_actual`.
+  `repid_score`. All three are public. The proof binds the claim to that score and threshold.
+  It binds it to the agent only weakly: agent_id is in no constraint, only the Fiat-Shamir
+  transcript, so about 1 in 256 other agent ids verify the same proof bytes (repid-engine
+  P-15, #1541). It does not hide the score, and the HTTP response returns it as `repid_score_actual`.
 - **Constraints.** One trace row of 32 bit-columns holding `gap = repid_score - threshold - 1`.
   The high 16 columns must be zero, the low 16 must be boolean, and on the first row they must
   recombine to `repid_score - threshold - 1` computed from the public values. When the score is
