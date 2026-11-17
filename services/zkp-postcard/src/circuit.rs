@@ -387,20 +387,21 @@ mod tests {
     /// by `eval`, so only the trace and the public values decide the outcome.
     fn trace_forgery_fails(agent: &str, threshold: u64, repid: u64, trace: RowMajorMatrix<BabyBear>) -> bool {
         use std::panic;
+        // Setup runs OUTSIDE the catch: a setup failure must fail the test, not count as a rejection.
+        // (Codex review of 328cfac: the old helper caught every panic, so an unrelated failure read as "forgery rejected".)
+        let config = test_config!();
+        let air = RepIdRangeCheckAir { value: 0 };
+        let pv = build_public_values(agent, threshold, repid).unwrap();
         let prev = panic::take_hook();
-        panic::set_hook(Box::new(|_| {})); // silence the expected unsatisfiable-constraint panic
-        let out = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            let config = test_config!();
-            let air = RepIdRangeCheckAir { value: 0 };
-            let pv = build_public_values(agent, threshold, repid).unwrap();
-            let proof = prove(&config, &air, trace, &pv);
-            verify(&config, &air, &proof, &pv)
-        }));
+        panic::set_hook(Box::new(|_| {})); // silence the expected debug-build constraint panic
+        let proved = panic::catch_unwind(panic::AssertUnwindSafe(|| prove(&config, &air, trace, &pv)));
         panic::set_hook(prev);
-        match out {
-            Err(_) => true,       // prover could not satisfy constraints
-            Ok(Err(_)) => true,   // verifier rejected
-            Ok(Ok(())) => false,  // FORGERY ACCEPTED — soundness broken
+        match proved {
+            // Under debug_assertions Plonky3 checks the constraints and panics on an unsatisfiable trace: a real rejection.
+            Err(_) if cfg!(debug_assertions) => true,
+            // A release build does not check constraints while proving, so a panic there is something else. Fail loudly.
+            Err(_) => panic!("prove panicked in a release build, where it does not check constraints: not an expected rejection"),
+            Ok(proof) => verify(&config, &air, &proof, &pv).is_err(), // false = FORGERY ACCEPTED, soundness broken
         }
     }
 
