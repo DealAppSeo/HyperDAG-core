@@ -397,10 +397,18 @@ mod tests {
         let proved = panic::catch_unwind(panic::AssertUnwindSafe(|| prove(&config, &air, trace, &pv)));
         panic::set_hook(prev);
         match proved {
-            // Under debug_assertions Plonky3 checks the constraints and panics on an unsatisfiable trace: a real rejection.
-            Err(_) if cfg!(debug_assertions) => true,
-            // A release build does not check constraints while proving, so a panic there is something else. Fail loudly.
-            Err(_) => panic!("prove panicked in a release build, where it does not check constraints: not an expected rejection"),
+            // Under debug_assertions, `prove` runs p3-air `check_constraints`, which refuses an unsatisfiable trace with exactly
+            // this panic (p3-air check_constraints.rs at the pinned rev). That is a real rejection. Any other panic, or any panic in
+            // a release build (no constraint check while proving), is not: fail loudly. (Codex review of efd0814: the first
+            // version counted every debug-build panic as a rejection.)
+            Err(p) => {
+                let msg = p.downcast_ref::<String>().map(String::as_str).or_else(|| p.downcast_ref::<&str>().copied()).unwrap_or("");
+                assert!(
+                    cfg!(debug_assertions) && msg.starts_with("constraints not satisfied on row"),
+                    "prove panicked, and not with Plonky3's debug constraint check (release build, or another failure): {msg}"
+                );
+                true
+            }
             Ok(proof) => verify(&config, &air, &proof, &pv).is_err(), // false = FORGERY ACCEPTED, soundness broken
         }
     }
@@ -469,5 +477,15 @@ mod tests {
             trace_forgery_fails(AGENT_A, 1000, 1000, RowMajorMatrix::new(row, 32)),
             "a non-boolean bit summing to -1 MUST fail"
         );
+    }
+
+    #[test]
+    fn test_forgery_helper_does_not_swallow_a_setup_failure() {
+        // build_public_values refuses a value >= 2^31. That must surface as its own panic, not as "forgery rejected" and not
+        // as the helper's "prove panicked" assertion (which is what a setup moved back inside the catch would produce).
+        let r = std::panic::catch_unwind(|| trace_forgery_fails(AGENT_A, 1u64 << 31, 0, generate_trace::<BabyBear>(0)));
+        let p = r.expect_err("a setup failure must panic, not return a verdict");
+        let msg = p.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(msg.contains("must be < 2^31") && !msg.contains("prove panicked"), "setup failure must surface directly: {msg}");
     }
 }
